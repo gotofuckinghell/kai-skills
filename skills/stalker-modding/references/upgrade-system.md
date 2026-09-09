@@ -1,0 +1,40 @@
+# Clear Sky upgrade system — trees, schemes, limits (engine-verified)
+
+## File map
+| File | Role |
+|------|------|
+| `weapons/w_*.ltx`, `misc/outfit.ltx` | ITEM sections: `upgrades = up_gr_*...` (the only wiring list) + `upgrade_scheme = upgrade_scheme_u*` |
+| `weapons/upgrades/w_*_up.ltx`, `misc/outfit_upgrades/o_*.ltx` | Branch definitions: `[up_gr_*]`, `[up_*]`, `[up_sect_*]` per item |
+| `configs/ui/inventory_upgrade.xml` | UI scheme cells: `name="upgrade_scheme_u*"` → grid of cells keyed by `scheme_index` |
+| `misc/inventory_upgrades.ltx` | `[upgraded_inventory]`: every upgradeable item, loaded at STARTUP with section-existence checks |
+| `misc/stalkers_upgarde_info.ltx` | Mechanics: `[<mech>]` = item list, `[<mech>_upgr]` = `up_sect_*` condition lines |
+| `configs/item_upgrades.ltx` | Manifest: `#include`s all tree files (db file; gamedata copy only if a mod ships one) |
+
+## Wiring (from inventory_upgrade_root.cpp / manager)
+- `Root::construct`: reads the ITEM's `upgrades =` string and calls `add_dependent_groups` on it ONLY. Branches defined in the tree file but absent from the item's `upgrades =` list are dead — never shown, never installable. Engine source: `xrGame/inventory_upgrade_root.cpp`, `inventory_upgrade_manager.cpp`.
+- Level-chains are auto-wired: each element (`up_X_item`) carries `effects = up_gr_<next>_item`, and `Upgrade::construct` calls `add_dependent_groups` on it recursively (that group's parent is the element, so `can_install` demands it installed first). SRP's `up_gr_i2`/`up_gr_i3` therefore ARE reachable once base `up_gr_i` is wired and installed — a «5 upgrades then nothing» report on such an item is often just the chain not yet tried (or the scheme XML lacks cells for the i2/i3 indices). Only sibling ALTERNATIVE branches (ac/bd vs ab/cd — shared slot letters via common elements) need explicit listing in the item's `upgrades =`.
+- `load_all_inventory` iterates `[upgraded_inventory]` and calls `item_upgrades_exist` → `VERIFY2(section_exist(item))` — a listed name with no section in pSettings is a STARTUP FATAL (`Inventory item [X] does not exist!`), not a silent skip.
+- `Upgrade::can_install` (`inventory_upgrade_group.cpp`): blocked unless (a) every parent upgrade is installed (`result_e_parents`) and (b) no other upgrade of the same group is installed (`result_e_group`).
+- Mechanic gate is purely the `[<mech>]` item list + `[<mech>_upgr]` lines. A commented-out `up_sect_*` line ≡ absent ≡ condition removed; a `*_upgr` section with no lines = mechanic knows every upgrade for his listed items (the «all upgrades» cheat is: full item lists + all `up_sect_* = false` / `= {+info_...}` lines commented). The gate executes in the db script `scripts/inventory_upgrades.script` (never in gamedata, not shipped by SRP): `can_upgrade_item(item, mechanic)` returns false if the mechanic's section has `he_upgrade_nothing` or lacks the item name line; `precondition_functor_a` checks the item's `up_sect_*` line in `[<mech>_upgr]` only when present (false → blocked, condlist → info check), else money-only (`cost` lives in the item's `up_sect_*` section, read via `item_upgrades.ltx`). All known bases (vanilla db, SRP, full-upgrades mod) ship the SAME nine mechanic sections — an NPC without one has no upgrade UI at all; Sakharov (Yantar, sells scientific_outfit) never had a section. Adding `[<npc>]` with the canonical item list + empty `[<npc>_upgr]` turns any NPC into a mechanic.
+
+## Save-load compatibility (loading a save re-installs its upgrades)
+- A save stores installed upgrades by BRANCH NAME (up_gr_ab_pm, ...). On load, `net_Spawn_install_upgrades` → `Manager::upgrade_install` → `upgrade_verify(item_section, upgrade_id)`, which VERIFY2-FATALs unless: item root exists, the branch is registered in the manager, AND `root->contain_upgrade(id)` (branch present in the item's current `upgrades =` wiring). A branch section in pSettings alone is NOT enough.
+- Consequence: switching the generation of ITEM files (w_*.ltx / outfit.ltx `upgrades =` refs) under a live save = load FATAL `Can't open section 'up_gr_ab_pm'` — same message as missing branch definitions, different cause (item-generation swap, not tree-file swap). Tree-file (w_*_up.ltx/o_*.ltx) and item-file (w_*.ltx/outfit.ltx) generations must BOTH match the save's era.
+- Recovery order that worked: (1) restore item files + tree files from `.bak_*` snapshots taken from the then-working state (they reproduce the loadable generation exactly), (2) re-apply config deltas key-by-key onto the restored files (armor boosts, sprint — NOT whole-file copies of other generations), (3) audit. Only then consider generation changes, which equal a new game.
+- Save-safe upgrade change: append branches that already exist in the tree file to the item's `upgrades =` list (2nd-level alternatives SRP ships but never wires). Saves only reference installed branches, so extra wiring never breaks load; it only adds visible options. Slot letters make 2nd-level branches ALTERNATIVES to base combos (e2 shares slot e with ef) — they extend choice, not total installs.
+
+## Hard engine limits (no config workaround)
+- `artefact_count` (outfit.ltx): clamped 0–5 in code — CustomOutfit.cpp `clamp(m_artefact_count, (u32)0, (u32)5)` (both Load and process_if_exists paths); UI `CUIActorMenu::UpdateOutfit` VERIFYs `af_count <= 5` and iterates a fixed 5-element `m_belt_list_over[]` overlay array. BeltWidth() = outfit artefact_count. Values >5 in config are dead on stock binaries; raising artefact slots needs an engine/UI binary patch.
+- Scheme cells: `inventory_upgrade.xml` per-scheme cell count is the UI ceiling for visible branches; branches beyond the cells exist in the tree (load-safe) but show nowhere.
+- «Full upgrades» mod (e.g. `full_upgrades_for_armors_and_weapons_mod_1.0`): single-letter sequential branches `up_gr_a_<item>`, `up_gr_b_...` … then 2nd level `up_gr_e2_/f2_/...`, 3rd `e3` — 9–15 installable upgrades per item, every one fits after the previous.
+- Vanilla / SRP-style: combo branches `up_gr_ab/cd/ef/gh/k_<item>` — 4–6 per item. SRP tree files may ALSO contain 2nd-level branches (ac, bd, e2, f2h2…) that its own `upgrades =` lists never connect → the «limit» complaint.
+- The pair (item file + its tree file) MUST come from one generation: mod item section + vanilla tree = branch refs with no definitions (`Can't open section 'up_gr_*'` FATAL on load); mod tree + vanilla item list = «limit».
+
+## Restoring a full-upgrades mod after a big patch wiped it
+> Save warning: this restoration swaps the whole upgrade generation and therefore invalidates saves made under the patch's generation — see Save-load compatibility above. Under a live patch-era save, FIRST restore the patch generation from `.bak_*` snapshots of the working state; only install the mod generation when a new game is acceptable.
+1. Copy the WHOLE generation back from the mod's source archive (user keeps mod zips/folders on Desktop, e.g. `Desktop\stalker CleasSky\`), including the outfit.ltx that carries armor boosts/sprint — do not rebuild files by hand.
+2. The pre-patch mtime snapshot does NOT cover old mod files (only files newer than the install date) — if the patch overwrote old-dated files, the snapshot cannot restore them; the mod archive is the source of truth.
+3. Re-verify with scripts/audit_upgrade_refs.py (every item `upgrades =` ref resolves in tree files), then:
+   - schemes: every `upgrade_scheme =` value used by items must exist as a cell name in `configs/ui/inventory_upgrade.xml` (SetCurScheme VERIFY2 «Scheme <u*> does not loaded» — UI FATAL on opening the upgrade window). There are NO `[upgrade_scheme_*]` ltx sections anywhere — the XML is the only home.
+   - `[upgraded_inventory]`: every listed name must have a section (startup FATAL otherwise). Mod generations that lack a few `_up2` items (e.g. wpn_g36_up2, wpn_walther_up2) need CLONES appended: full copy of the base item section renamed, same `upgrades =` (branches exist), `installed_upgrades` commented out.
+   - duplicates/CRLF sweep over every copied file.
